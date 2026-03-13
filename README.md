@@ -2,10 +2,12 @@
 
 一个 Tampermonkey 用户脚本，增强 [Gemini](https://gemini.google.com) 的使用体验。部分功能移植自 [Gemini Voyager](https://github.com/nicepkg/gemini-voyager) 浏览器扩展。
 
+**Greasy Fork:** <https://greasyfork.org/en/scripts/569478-gemini-helper>
+
 ## 安装
 
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/)（Chrome / Edge / Firefox / Safari）
-2. 打开 `gemini-helper.user.js`，在 Tampermonkey 弹窗中点击 **安装**
+2. 从 [Greasy Fork](https://greasyfork.org/en/scripts/569478-gemini-helper) 一键安装，或打开 `gemini-helper.user.js` 在 Tampermonkey 弹窗中点击 **安装**
 3. 访问 [gemini.google.com](https://gemini.google.com)，所有功能自动生效
 
 ## 功能
