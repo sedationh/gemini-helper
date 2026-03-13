@@ -276,7 +276,7 @@
             btn.title = 'Chat Width';
             btn.textContent = '↔';
             Object.assign(btn.style, {
-                position: 'fixed', bottom: '80px', right: '16px', zIndex: '2147483640',
+                position: 'fixed', bottom: '80px', right: '52px', zIndex: '2147483640',
                 width: '36px', height: '36px', borderRadius: '50%', border: 'none',
                 background: enabled ? '#1a73e8' : '#5f6368', color: '#fff',
                 fontSize: '16px', cursor: 'pointer', boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
@@ -294,7 +294,7 @@
                 }
                 sliderContainer = document.createElement('div');
                 Object.assign(sliderContainer.style, {
-                    position: 'fixed', bottom: '120px', right: '16px', zIndex: '2147483641',
+                    position: 'fixed', bottom: '120px', right: '52px', zIndex: '2147483641',
                     background: '#fff', borderRadius: '12px', padding: '16px',
                     boxShadow: '0 4px 24px rgba(0,0,0,0.15)', width: '220px',
                     fontFamily: 'Google Sans, Roboto, sans-serif',
@@ -841,7 +841,7 @@
         const TIMELINE_STYLE_ID = 'gemini-helper-timeline-style';
         let timelineBar = null;
         let trackContent = null;
-        let tooltip = null;
+        let previewPanel = null;
         let scrollContainer = null;
         let convContainer = null;
         let userTurnSelector = '';
@@ -852,6 +852,8 @@
         let intersectionObs = null;
         let visibleTurns = new Set();
         let destroyed = false;
+        let isScrollingProgrammatic = false;
+        let scrollingTimer = null;
 
         function injectStyles() {
             if (document.getElementById(TIMELINE_STYLE_ID)) return;
@@ -957,32 +959,89 @@
                     background: #000;
                 }
                 .gh-tl-dot:hover::after { transform: translate(-50%, -50%) scale(1.15); }
+                .gh-tl-dot:focus { outline: none; }
                 .gh-tl-dot:focus-visible::after { box-shadow: 0 0 6px var(--tl-dot-active); }
                 .gh-tl-dot.active::after {
                     box-shadow: 0 0 0 var(--tl-active-ring) var(--tl-dot-active),
                                 0 0 14px oklch(0.55 0.17 155 / 0.5);
                 }
                 .gh-tl-dot.starred::after { background-color: var(--tl-star-color); }
-                .gh-tl-tooltip {
+
+                /* Preview panel - shows all messages on hover */
+                .gh-tl-preview {
                     position: fixed;
                     z-index: 2147483647;
-                    pointer-events: none;
                     background: var(--tl-tip-bg);
                     color: var(--tl-tip-text);
                     border: 1px solid var(--tl-tip-border);
                     border-radius: 14px;
-                    padding: 10px 12px;
+                    padding: 8px 0;
                     font-size: 13px;
                     line-height: 18px;
                     box-shadow: 0 12px 36px rgba(2,8,23,0.18), 0 3px 8px rgba(2,8,23,0.08);
-                    max-width: 288px;
-                    overflow: hidden;
-                    white-space: normal;
-                    word-break: break-word;
+                    width: 300px;
+                    max-height: calc(100vh - 120px);
+                    overflow-y: auto;
+                    overflow-x: hidden;
                     opacity: 0;
-                    transition: opacity 140ms cubic-bezier(0.2,0.8,0.2,1);
+                    pointer-events: none;
+                    transition: opacity 160ms cubic-bezier(0.2,0.8,0.2,1);
+                    scrollbar-width: thin;
                 }
-                .gh-tl-tooltip.visible { opacity: 1; }
+                .gh-tl-preview.visible {
+                    opacity: 1;
+                    pointer-events: auto;
+                }
+                .gh-tl-preview-item {
+                    display: flex;
+                    align-items: flex-start;
+                    gap: 8px;
+                    padding: 8px 14px;
+                    cursor: pointer;
+                    transition: background 0.1s;
+                    border: none;
+                    background: none;
+                    width: 100%;
+                    text-align: left;
+                    color: inherit;
+                    font: inherit;
+                    line-height: 18px;
+                }
+                .gh-tl-preview-item:hover {
+                    background: var(--tl-tip-border);
+                }
+                .gh-tl-preview-item.is-active {
+                    background: color-mix(in oklch, var(--tl-dot-active) 15%, transparent);
+                }
+                .gh-tl-preview-num {
+                    flex-shrink: 0;
+                    width: 22px;
+                    height: 22px;
+                    border-radius: 50%;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    font-size: 11px;
+                    font-weight: 600;
+                    background: var(--tl-dot-color);
+                    color: var(--tl-tip-bg);
+                }
+                .gh-tl-preview-item.is-active .gh-tl-preview-num {
+                    background: var(--tl-dot-active);
+                }
+                .gh-tl-preview-text {
+                    flex: 1;
+                    min-width: 0;
+                    overflow: hidden;
+                    display: -webkit-box;
+                    -webkit-line-clamp: 2;
+                    -webkit-box-orient: vertical;
+                    word-break: break-word;
+                }
+                .gh-tl-preview::-webkit-scrollbar { width: 4px; }
+                .gh-tl-preview::-webkit-scrollbar-thumb {
+                    background: var(--tl-dot-color); border-radius: 2px;
+                }
             `);
             document.head.appendChild(style);
         }
@@ -1101,34 +1160,101 @@
             markers.forEach(m => {
                 if (m.dotElement) m.dotElement.classList.toggle('active', m.id === activeTurnId);
             });
+            updatePreviewActiveItem();
         }
 
         function smoothScrollTo(element) {
+            isScrollingProgrammatic = true;
+            if (scrollingTimer) clearTimeout(scrollingTimer);
             element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            scrollingTimer = setTimeout(() => { isScrollingProgrammatic = false; }, 800);
         }
 
-        function showTooltip(dot) {
-            if (!tooltip) return;
-            const text = dot.getAttribute('aria-label') || '';
-            tooltip.textContent = text;
-            tooltip.classList.remove('visible');
+        // ── Preview Panel ──
+        let previewHideTimer = null;
 
-            const dotRect = dot.getBoundingClientRect();
-            const tipW = 288;
-            // Position to the left of the bar
-            let left = dotRect.left - 12 - tipW;
-            if (left < 8) left = dotRect.right + 12;
-            let top = dotRect.top + dotRect.height / 2 - 25;
-            top = Math.max(8, Math.min(window.innerHeight - 60, top));
+        function buildPreviewPanel() {
+            if (!previewPanel) return;
+            // Clear existing items
+            while (previewPanel.firstChild) previewPanel.removeChild(previewPanel.firstChild);
 
-            tooltip.style.left = left + 'px';
-            tooltip.style.top = top + 'px';
-            tooltip.style.width = tipW + 'px';
-            requestAnimationFrame(() => tooltip.classList.add('visible'));
+            markers.forEach((m, idx) => {
+                const item = document.createElement('button');
+                item.className = 'gh-tl-preview-item';
+                if (m.id === activeTurnId) item.classList.add('is-active');
+                item.dataset.markerIndex = String(idx);
+
+                const num = document.createElement('span');
+                num.className = 'gh-tl-preview-num';
+                num.textContent = String(idx + 1);
+
+                const text = document.createElement('span');
+                text.className = 'gh-tl-preview-text';
+                text.textContent = m.summary;
+
+                item.appendChild(num);
+                item.appendChild(text);
+
+                item.addEventListener('click', () => {
+                    activeTurnId = m.id;
+                    updateActiveDots();
+                    smoothScrollTo(m.element);
+                });
+
+                previewPanel.appendChild(item);
+            });
         }
 
-        function hideTooltip() {
-            if (tooltip) tooltip.classList.remove('visible');
+        function updatePreviewActiveItem() {
+            if (!previewPanel) return;
+            const items = previewPanel.querySelectorAll('.gh-tl-preview-item');
+            items.forEach((item, idx) => {
+                const isActive = markers[idx] && markers[idx].id === activeTurnId;
+                item.classList.toggle('is-active', isActive);
+                if (isActive && previewPanel.classList.contains('visible')) {
+                    // Scroll active item into view within the panel
+                    const panelRect = previewPanel.getBoundingClientRect();
+                    const itemRect = item.getBoundingClientRect();
+                    if (itemRect.top < panelRect.top || itemRect.bottom > panelRect.bottom) {
+                        item.scrollIntoView({ block: 'nearest' });
+                    }
+                }
+            });
+        }
+
+        function showPreviewPanel() {
+            if (!previewPanel || !timelineBar) return;
+            if (previewHideTimer) { clearTimeout(previewHideTimer); previewHideTimer = null; }
+            buildPreviewPanel();
+
+            const barRect = timelineBar.getBoundingClientRect();
+            const panelW = 300;
+            let left = barRect.left - 8 - panelW;
+            if (left < 8) left = barRect.right + 8;
+            const top = barRect.top;
+            const maxH = window.innerHeight - top - 20;
+
+            previewPanel.style.left = left + 'px';
+            previewPanel.style.top = top + 'px';
+            previewPanel.style.maxHeight = maxH + 'px';
+
+            requestAnimationFrame(() => previewPanel.classList.add('visible'));
+
+            // Scroll active item into view
+            const activeItem = previewPanel.querySelector('.is-active');
+            if (activeItem) setTimeout(() => activeItem.scrollIntoView({ block: 'nearest' }), 20);
+        }
+
+        function hidePreviewPanel() {
+            if (previewHideTimer) clearTimeout(previewHideTimer);
+            previewHideTimer = setTimeout(() => {
+                if (previewPanel) previewPanel.classList.remove('visible');
+                previewHideTimer = null;
+            }, 200);
+        }
+
+        function cancelHidePreview() {
+            if (previewHideTimer) { clearTimeout(previewHideTimer); previewHideTimer = null; }
         }
 
         function setupIntersectionObserver() {
@@ -1141,6 +1267,8 @@
                     if (entry.isIntersecting) visibleTurns.add(entry.target);
                     else visibleTurns.delete(entry.target);
                 });
+                // Skip active-dot updates during programmatic scroll to prevent flashing
+                if (isScrollingProgrammatic) return;
                 // Find the first visible marker
                 for (const m of markers) {
                     if (visibleTurns.has(m.element)) {
@@ -1179,9 +1307,10 @@
             track.appendChild(trackContent);
             timelineBar.appendChild(track);
 
-            tooltip = document.createElement('div');
-            tooltip.className = 'gh-tl-tooltip';
-            document.body.appendChild(tooltip);
+            // Preview panel
+            previewPanel = document.createElement('div');
+            previewPanel.className = 'gh-tl-preview';
+            document.body.appendChild(previewPanel);
 
             // Event: click to navigate
             timelineBar.addEventListener('click', e => {
@@ -1196,16 +1325,11 @@
                 }
             });
 
-            // Event: hover tooltip
-            timelineBar.addEventListener('mouseover', e => {
-                const dot = e.target.closest('.gh-tl-dot');
-                if (dot) showTooltip(dot);
-            });
-            timelineBar.addEventListener('mouseout', e => {
-                const from = e.target.closest('.gh-tl-dot');
-                const to = e.relatedTarget && e.relatedTarget.closest ? e.relatedTarget.closest('.gh-tl-dot') : null;
-                if (from && !to) hideTooltip();
-            });
+            // Event: hover shows preview panel
+            timelineBar.addEventListener('mouseenter', () => showPreviewPanel());
+            timelineBar.addEventListener('mouseleave', () => hidePreviewPanel());
+            previewPanel.addEventListener('mouseenter', () => cancelHidePreview());
+            previewPanel.addEventListener('mouseleave', () => hidePreviewPanel());
 
             // Event: scroll passthrough
             timelineBar.addEventListener('wheel', e => {
@@ -1252,7 +1376,7 @@
             destroyed = true;
             if (mutationObs) { mutationObs.disconnect(); mutationObs = null; }
             if (intersectionObs) { intersectionObs.disconnect(); intersectionObs = null; }
-            document.querySelectorAll('.gh-timeline-bar, .gh-tl-tooltip').forEach(el => el.remove());
+            document.querySelectorAll('.gh-timeline-bar, .gh-tl-preview').forEach(el => el.remove());
             markers = [];
         }
 
