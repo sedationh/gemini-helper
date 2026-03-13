@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Gemini Remove Dollar Signs from Copy
+// @name         Gemini Helper
 // @namespace    http://tampermonkey.net/
-// @version      1.1
-// @description  Removes $ characters from text copied from Gemini
+// @version      2.0
+// @description  Gemini enhancements migrated from Voyager — includes copy dollar-sign removal and more
 // @match        https://gemini.google.com/*
 // @grant        none
 // @run-at       document-start
