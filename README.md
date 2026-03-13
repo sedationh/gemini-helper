@@ -1,88 +1,89 @@
 # Gemini Helper
 
-A Tampermonkey userscript that enhances the [Gemini](https://gemini.google.com) experience. Some features are migrated from the [Gemini Voyager](https://github.com/nicepkg/gemini-voyager) browser extension.
+一个 Tampermonkey 用户脚本，增强 [Gemini](https://gemini.google.com) 的使用体验。部分功能移植自 [Gemini Voyager](https://github.com/nicepkg/gemini-voyager) 浏览器扩展。
 
-## Installation
+## 安装
 
-1. Install [Tampermonkey](https://www.tampermonkey.net/) (Chrome / Edge / Firefox / Safari)
-2. Open `gemini-helper.user.js` and click **Install** in the Tampermonkey prompt
-3. Visit [gemini.google.com](https://gemini.google.com) — all features activate automatically
+1. 安装 [Tampermonkey](https://www.tampermonkey.net/)（Chrome / Edge / Firefox / Safari）
+2. 打开 `gemini-helper.user.js`，在 Tampermonkey 弹窗中点击 **安装**
+3. 访问 [gemini.google.com](https://gemini.google.com)，所有功能自动生效
 
-## Features
+## 功能
 
-### 1. Strip Dollar Signs from Copy
+### 1. 复制时去除美元符号
 
-Gemini renders LaTeX formulas with `$` delimiters. When you copy text containing formulas, the raw `$` and `\` escape characters pollute your clipboard.
+Gemini 在渲染 LaTeX 公式时会使用 `$` 分隔符。复制含公式的文本时，剪贴板中会混入 `$` 和 `\` 转义字符。
 
-This feature intercepts all copy operations (selection copy, `navigator.clipboard.writeText`, `navigator.clipboard.write`) and automatically strips `$` signs and backslash-prefixed commands like `\min` → `min`.
+该功能拦截所有复制操作（选中复制、`navigator.clipboard.writeText`、`navigator.clipboard.write`），自动去除 `$` 符号并将 `\min` 等反斜杠命令还原为 `min`。
 
-**Before:** `$dp[i] = \min(dp[i], dp[i - coin] + 1)$`
-**After:** `dp[i] = min(dp[i], dp[i - coin] + 1)`
+**处理前：** `$dp[i] = \min(dp[i], dp[i - coin] + 1)$`
+**处理后：** `dp[i] = min(dp[i], dp[i - coin] + 1)`
 
-No configuration needed — always active.
-
----
-
-### 2. Chat Width
-
-Freely adjust the chat content width for a better viewing experience, especially on wide monitors.
-
-- A floating `↔` button appears at the bottom-right corner
-- Click it to reveal a control panel with:
-  - **Toggle switch** — enable / disable width override
-  - **Slider** — adjust width from 30% to 100% of screen width
-- Settings persist across sessions (saved in `localStorage`)
-- Automatically re-applies when new messages load
-- Supports dark mode
+无需配置，始终生效。
 
 ---
 
-### 3. Default Model
+### 2. 聊天宽度调节
 
-Stop repeating yourself — auto-switch to your preferred model on every new chat.
+自由调整聊天内容宽度，尤其适合宽屏显示器。
 
-- Open the model selector menu and you'll see a **★ star button** next to each model name
-- Click the star to set that model as your default
-- On every new conversation (`/app` or `/gem/*`), the script automatically:
-  1. Detects the current model
-  2. Opens the model menu
-  3. Switches to your starred default
-  4. Focuses the chat input
-- Flash/Fast models are skipped (Gemini already defaults to them)
-- Click the star again to clear the default
-- Toast notifications confirm your actions
-- Works with SPA navigation — no page reload needed
+- 右下角会出现一个浮动 `↔` 按钮
+- 点击后展开控制面板：
+  - **开关** — 启用 / 禁用宽度覆盖
+  - **滑块** — 在 30% 到 100% 屏幕宽度之间调节
+- 设置跨会话持久化（保存在 `localStorage`）
+- 新消息加载时自动重新应用
+- 支持暗色模式
 
 ---
 
-### 4. Timeline
+### 3. 默认模型
 
-A visual map for your mind — navigate long conversations at a glance.
+不再每次手动切换 — 自动锁定你偏好的模型。
 
-- A vertical **timeline bar** appears on the right edge of the screen
-- Each **dot** represents a user message in the conversation
-- The **active dot** (green ring) shows which message you're currently viewing
-- **Click** any dot to smooth-scroll to that message
-- **Hover** over a dot to see a text preview tooltip
-- **Scroll wheel** over the bar passes through to the main content
-- Automatically updates when new messages are added
-- Adapts to Gemini's light / dark theme
-- Only shows on conversation routes (`/app`, `/gem/*`)
-- Cleans up properly on navigation away
+- 打开模型选择菜单，每个模型名称旁会出现一个 **★ 星标按钮**
+- 点击星标将该模型设为默认
+- 每次新对话（`/app` 或 `/gem/*`）时，脚本自动：
+  1. 检测当前模型
+  2. 打开模型菜单
+  3. 切换到你的默认模型
+  4. 聚焦聊天输入框
+- Flash/Fast 模型会被跳过（Gemini 已默认使用）
+- 再次点击星标可取消默认
+- Toast 通知确认操作
+- SPA 路由跳转无需刷新页面
 
 ---
 
-## Settings Storage
+### 4. 时间线导航
 
-All settings are stored in `localStorage` under these keys:
+长对话的可视化导航，一目了然。
 
-| Key | Description |
-|-----|-------------|
-| `geminiHelperSettings` | Chat width enabled state and percentage |
-| `geminiHelperDefaultModel` | Starred default model (`{id, name}`) |
+- 屏幕右侧边缘出现一条垂直 **时间线**
+- 每个 **圆点** 代表对话中的一条用户消息
+- **活跃圆点**（绿色圆环）指示当前可见的消息
+- **点击**圆点可平滑滚动到对应消息
+- **悬浮**到时间线区域时，弹出预览面板，展示所有消息摘要列表
+  - 列表中高亮当前活跃消息
+  - 点击列表项可快速跳转
+- 新消息添加时自动更新
+- 自适应 Gemini 的亮色 / 暗色主题
+- 仅在对话路由（`/app`、`/gem/*`）下显示
+- 离开对话页面时自动清理
 
-No external network requests. No data leaves your browser.
+---
 
-## License
+## 数据存储
+
+所有设置保存在 `localStorage`，使用以下键名：
+
+| 键名 | 说明 |
+|------|------|
+| `geminiHelperSettings` | 聊天宽度的启用状态和百分比 |
+| `geminiHelperDefaultModel` | 星标默认模型（`{id, name}`） |
+
+不发起任何外部网络请求，数据不会离开你的浏览器。
+
+## 许可证
 
 MIT
