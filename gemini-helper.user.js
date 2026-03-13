@@ -850,6 +850,7 @@
         let scrollRafId = null;
         let mutationObs = null;
         let intersectionObs = null;
+        let activeUpdateTimer = null;
         let visibleTurns = new Set();
         let destroyed = false;
         let isScrollingProgrammatic = false;
@@ -951,7 +952,7 @@
                     transform: translate(-50%, -50%);
                     border-radius: 50%;
                     background-color: var(--tl-dot-color);
-                    transition: transform 0.15s ease, box-shadow 0.15s ease;
+                    transition: transform 0.15s ease;
                 }
                 html.dark .gh-tl-dot:not(.active):not(.starred)::after,
                 [data-theme='dark'] .gh-tl-dot:not(.active):not(.starred)::after,
@@ -1082,7 +1083,7 @@
             const clone = el.cloneNode(true);
             clone.querySelectorAll('.visually-hidden, [aria-hidden="true"]').forEach(n => n.remove());
             let text = (clone.textContent || '').trim();
-            text = text.replace(/^[\u200B-\u200F\uFEFF]*(?:you said|you wrote|user message|your prompt|you asked)[:\s]*/i, '');
+            text = text.replace(/^[\u200B-\u200F\uFEFF]*(?:you said|you wrote|user message|your prompt|you asked|你说|你写道|用户消息|你的提示|你问)[:\s\uff1a]*/i, '');
             return text.slice(0, 120) || '(empty)';
         }
 
@@ -1166,8 +1167,23 @@
         function smoothScrollTo(element) {
             isScrollingProgrammatic = true;
             if (scrollingTimer) clearTimeout(scrollingTimer);
+
+            const done = () => {
+                scrollContainer.removeEventListener('scrollend', onEnd);
+                clearTimeout(scrollingTimer);
+                // small extra delay so final intersection entries settle
+                scrollingTimer = setTimeout(() => { isScrollingProgrammatic = false; }, 200);
+            };
+            const onEnd = () => done();
+            scrollContainer.addEventListener('scrollend', onEnd, { once: true });
+
             element.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            scrollingTimer = setTimeout(() => { isScrollingProgrammatic = false; }, 800);
+
+            // fallback if scrollend never fires
+            scrollingTimer = setTimeout(() => {
+                scrollContainer.removeEventListener('scrollend', onEnd);
+                isScrollingProgrammatic = false;
+            }, 2000);
         }
 
         // ── Preview Panel ──
@@ -1267,18 +1283,20 @@
                     if (entry.isIntersecting) visibleTurns.add(entry.target);
                     else visibleTurns.delete(entry.target);
                 });
-                // Skip active-dot updates during programmatic scroll to prevent flashing
                 if (isScrollingProgrammatic) return;
-                // Find the first visible marker
-                for (const m of markers) {
-                    if (visibleTurns.has(m.element)) {
-                        if (activeTurnId !== m.id) {
-                            activeTurnId = m.id;
-                            updateActiveDots();
+                // Debounce to avoid rapid active-dot toggling during scroll
+                if (activeUpdateTimer) clearTimeout(activeUpdateTimer);
+                activeUpdateTimer = setTimeout(() => {
+                    for (const m of markers) {
+                        if (visibleTurns.has(m.element)) {
+                            if (activeTurnId !== m.id) {
+                                activeTurnId = m.id;
+                                updateActiveDots();
+                            }
+                            break;
                         }
-                        break;
                     }
-                }
+                }, 100);
             }, { root, threshold: 0.1 });
 
             markers.forEach(m => intersectionObs.observe(m.element));
