@@ -4,6 +4,7 @@
 // @version      2.0
 // @description  Gemini enhancements migrated from Voyager — includes copy dollar-sign removal, chat width, default model, and timeline
 // @match        https://gemini.google.com/*
+// @license      MIT
 // @grant        none
 // @run-at       document-start
 // ==/UserScript==
