@@ -1,0 +1,896 @@
+/**
+ * Google Drive Sync Service
+ *
+ * Enterprise-grade service for syncing extension data to Google Drive
+ * Uses Chrome Identity API for OAuth2 and Drive REST API v3 for storage
+ *
+ * Stores folders, prompts, and starred messages as separate files:
+ * - gemini-voyager-folders.json
+ * - gemini-voyager-prompts.json
+ * - gemini-voyager-starred.json
+ */
+import type { FolderData } from '@/core/types/folder';
+import type {
+  FolderExportPayload,
+  ForkExportPayload,
+  ForkNodesDataSync,
+  PromptExportPayload,
+  PromptItem,
+  StarredExportPayload,
+  StarredMessagesDataSync,
+  SyncAccountScope,
+  SyncMode,
+  SyncPlatform,
+  SyncState,
+} from '@/core/types/sync';
+import { DEFAULT_SYNC_STATE } from '@/core/types/sync';
+import { hashString } from '@/core/utils/hash';
+import { EXTENSION_VERSION } from '@/core/utils/version';
+
+const FOLDERS_FILE_NAME = 'gemini-voyager-folders.json';
+const AISTUDIO_FOLDERS_FILE_NAME = 'gemini-voyager-aistudio-folders.json';
+const PROMPTS_FILE_NAME = 'gemini-voyager-prompts.json';
+const STARRED_FILE_NAME = 'gemini-voyager-starred.json';
+const FORKS_FILE_NAME = 'gemini-voyager-forks.json';
+const BACKUP_FOLDER_NAME = 'Gemini Voyager Data';
+const DRIVE_API_BASE = 'https://www.googleapis.com/drive/v3';
+const DRIVE_UPLOAD_BASE = 'https://www.googleapis.com/upload/drive/v3';
+
+// Retry configuration
+const MAX_RETRIES = 3;
+const INITIAL_RETRY_DELAY_MS = 1000;
+const IDENTITY_TOKEN_TTL_SECONDS = 55 * 60;
+
+/**
+ * Google Drive Sync Service
+ * Handles authentication, upload, and download of sync data as separate files
+ */
+export class GoogleDriveSyncService {
+  private state: SyncState = { ...DEFAULT_SYNC_STATE };
+  private foldersFileId: string | null = null;
+  private aistudioFoldersFileId: string | null = null;
+  private promptsFileId: string | null = null;
+  private starredFileId: string | null = null;
+  private forksFileId: string | null = null;
+  private backupFolderId: string | null = null;
+  private fileIdByName: Record<string, string> = {};
+  private stateChangeCallback: ((state: SyncState) => void) | null = null;
+  private accessToken: string | null = null;
+  private tokenExpiry: number = 0;
+  private stateLoadPromise: Promise<void> | null = null;
+
+  constructor() {
+    this.stateLoadPromise = this.loadState();
+  }
+
+  onStateChange(callback: (state: SyncState) => void): void {
+    this.stateChangeCallback = callback;
+  }
+
+  /**
+   * Ensure state is loaded before returning
+   */
+  async getState(): Promise<SyncState> {
+    if (this.stateLoadPromise) {
+      await this.stateLoadPromise;
+    }
+    return { ...this.state };
+  }
+
+  async setMode(mode: SyncMode): Promise<void> {
+    this.state.mode = mode;
+    await this.saveState();
+    this.notifyStateChange();
+  }
+
+  async authenticate(interactive: boolean = true): Promise<boolean> {
+    try {
+      this.updateState({ isSyncing: true, error: null });
+      const token = await this.getAuthToken(interactive);
+      if (!token) {
+        // If not interactive and no token, just return false silently
+        if (!interactive) {
+          this.updateState({ isAuthenticated: false, isSyncing: false });
+          return false;
+        }
+        throw new Error('Failed to obtain auth token');
+      }
+      this.updateState({ isAuthenticated: true, isSyncing: false });
+      return true;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Authentication failed';
+      console.error('[GoogleDriveSyncService] Authentication failed:', error);
+      this.updateState({ isAuthenticated: false, isSyncing: false, error: errorMessage });
+      return false;
+    }
+  }
+
+  async signOut(): Promise<void> {
+    try {
+      if (this.accessToken) {
+        await this.removeCachedAuthToken(this.accessToken);
+        await fetch(`https://accounts.google.com/o/oauth2/revoke?token=${this.accessToken}`);
+      }
+    } catch (error) {
+      console.warn('[GoogleDriveSyncService] Sign out warning:', error);
+    }
+    await this.clearToken();
+    this.foldersFileId = null;
+    this.promptsFileId = null;
+    this.starredFileId = null;
+    this.forksFileId = null;
+    this.backupFolderId = null;
+    this.fileIdByName = {};
+    this.updateState({ isAuthenticated: false, lastSyncTime: null, error: null });
+    await this.saveState();
+  }
+
+  /**
+   * Upload folders, prompts, and starred messages as separate files to Google Drive
+   * @param folders Folder data to upload
+   * @param prompts Prompt items (only for Gemini platform)
+   * @param starred Starred messages (only for Gemini platform)
+   * @param interactive Whether to show auth prompt if needed
+   * @param platform Platform to upload for ('gemini' | 'aistudio')
+   */
+  async upload(
+    folders: FolderData,
+    prompts: PromptItem[],
+    starred: StarredMessagesDataSync | null = null,
+    interactive: boolean = true,
+    platform: SyncPlatform = 'gemini',
+    forks: ForkNodesDataSync | null = null,
+    accountScope: SyncAccountScope | null = null,
+  ): Promise<boolean> {
+    try {
+      this.updateState({ isSyncing: true, error: null });
+
+      const token = await this.getAuthToken(interactive);
+      if (!token) {
+        if (!interactive) {
+          console.log(
+            '[GoogleDriveSyncService] Upload skipped: Not authenticated (non-interactive)',
+          );
+          this.updateState({ isSyncing: false, isAuthenticated: false });
+          return false;
+        }
+        throw new Error('Not authenticated');
+      }
+
+      const now = new Date();
+
+      // Create folder payload
+      const folderPayload: FolderExportPayload = {
+        format: 'gemini-voyager.folders.v1',
+        exportedAt: now.toISOString(),
+        version: EXTENSION_VERSION,
+        data: folders,
+      };
+
+      // Create prompt payload
+      const promptPayload: PromptExportPayload = {
+        format: 'gemini-voyager.prompts.v1',
+        exportedAt: now.toISOString(),
+        version: EXTENSION_VERSION,
+        items: prompts,
+      };
+
+      // Upload folders file (platform-specific)
+      const foldersBaseFileName =
+        platform === 'aistudio' ? AISTUDIO_FOLDERS_FILE_NAME : FOLDERS_FILE_NAME;
+      const foldersFileName = this.getFileNameForScope(foldersBaseFileName, accountScope);
+      const foldersType = platform === 'aistudio' ? 'aistudio-folders' : 'folders';
+      const foldersFileIdToUse = await this.ensureFileId(token, foldersFileName, foldersType);
+      await this.uploadFileWithRetry(token, foldersFileIdToUse, folderPayload);
+      console.log(`[GoogleDriveSyncService] ${platform} folders uploaded successfully`);
+
+      // Upload prompts file (shared between Gemini and AI Studio)
+      if (prompts.length > 0) {
+        const promptsFileName = this.getFileNameForScope(PROMPTS_FILE_NAME, accountScope);
+        const promptsFileId = await this.ensureFileId(token, promptsFileName, 'prompts');
+        await this.uploadFileWithRetry(token, promptsFileId, promptPayload);
+        console.log('[GoogleDriveSyncService] Prompts uploaded successfully');
+      }
+
+      // Upload starred messages file (only for Gemini platform)
+      if (platform === 'gemini' && starred) {
+        // Truncate content in starred messages to save storage space
+        const MAX_CONTENT_LENGTH = 60;
+        const truncatedStarred: StarredMessagesDataSync = {
+          messages: Object.fromEntries(
+            Object.entries(starred.messages).map(([convId, messages]) => [
+              convId,
+              messages.map((msg) => ({
+                ...msg,
+                content:
+                  msg.content.length > MAX_CONTENT_LENGTH
+                    ? msg.content.slice(0, MAX_CONTENT_LENGTH) + '...'
+                    : msg.content,
+              })),
+            ]),
+          ),
+        };
+
+        const starredPayload: StarredExportPayload = {
+          format: 'gemini-voyager.starred.v1',
+          exportedAt: now.toISOString(),
+          version: EXTENSION_VERSION,
+          data: truncatedStarred,
+        };
+        const starredFileName = this.getFileNameForScope(STARRED_FILE_NAME, accountScope);
+        const starredFileId = await this.ensureFileId(token, starredFileName, 'starred');
+        await this.uploadFileWithRetry(token, starredFileId, starredPayload);
+        console.log('[GoogleDriveSyncService] Starred messages uploaded successfully');
+      }
+
+      // Upload fork nodes file (only for Gemini platform)
+      if (platform === 'gemini' && forks) {
+        const forksPayload: ForkExportPayload = {
+          format: 'gemini-voyager.forks.v1',
+          exportedAt: now.toISOString(),
+          version: EXTENSION_VERSION,
+          data: forks,
+        };
+        const forksFileName = this.getFileNameForScope(FORKS_FILE_NAME, accountScope);
+        const forksFileId = await this.ensureFileId(token, forksFileName, 'forks');
+        await this.uploadFileWithRetry(token, forksFileId, forksPayload);
+        console.log('[GoogleDriveSyncService] Fork nodes uploaded successfully');
+      }
+
+      const uploadTime = Date.now();
+      // Update platform-specific upload time
+      if (platform === 'aistudio') {
+        this.updateState({ isSyncing: false, lastUploadTimeAIStudio: uploadTime, error: null });
+      } else {
+        this.updateState({ isSyncing: false, lastUploadTime: uploadTime, error: null });
+      }
+      await this.saveState();
+
+      const fileCount = platform === 'gemini' ? (starred ? (forks ? 4 : 3) : 2) : 1;
+      console.log(
+        `[GoogleDriveSyncService] Upload successful - ${fileCount} file(s) for ${platform}`,
+      );
+      return true;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Upload failed';
+      console.error('[GoogleDriveSyncService] Upload failed:', error);
+      this.updateState({ isSyncing: false, error: errorMessage });
+      return false;
+    }
+  }
+
+  /**
+   * Download folders, prompts, and starred messages from separate files in Google Drive
+   * Returns { folders, prompts, starred } or null if no files exist
+   * @param interactive Whether to show auth prompt if needed
+   * @param platform Platform to download for ('gemini' | 'aistudio')
+   */
+  async download(
+    interactive: boolean = true,
+    platform: SyncPlatform = 'gemini',
+    accountScope: SyncAccountScope | null = null,
+  ): Promise<{
+    folders: FolderExportPayload | null;
+    prompts: PromptExportPayload | null;
+    starred: StarredExportPayload | null;
+    forks: ForkExportPayload | null;
+  } | null> {
+    try {
+      this.updateState({ isSyncing: true, error: null });
+
+      const token = await this.getAuthToken(interactive);
+      if (!token) {
+        if (!interactive) {
+          console.log(
+            '[GoogleDriveSyncService] Download skipped: Not authenticated (non-interactive)',
+          );
+          this.updateState({ isSyncing: false, isAuthenticated: false });
+          return null;
+        }
+        throw new Error('Not authenticated');
+      }
+
+      // Download folders file (platform-specific)
+      const foldersBaseFileName =
+        platform === 'aistudio' ? AISTUDIO_FOLDERS_FILE_NAME : FOLDERS_FILE_NAME;
+      const foldersFileId = await this.findFileForScope(token, foldersBaseFileName, accountScope);
+      let folders: FolderExportPayload | null = null;
+      if (foldersFileId) {
+        folders = await this.downloadFileWithRetry(token, foldersFileId);
+        console.log(`[GoogleDriveSyncService] ${platform} folders downloaded`);
+      }
+
+      // Download prompts file (shared between Gemini and AI Studio)
+      let prompts: PromptExportPayload | null = null;
+      const promptsFileId = await this.findFileForScope(token, PROMPTS_FILE_NAME, accountScope);
+      if (promptsFileId) {
+        prompts = await this.downloadFileWithRetry(token, promptsFileId);
+        console.log('[GoogleDriveSyncService] Prompts downloaded');
+      }
+
+      // Download starred messages file (only for Gemini platform)
+      let starred: StarredExportPayload | null = null;
+      if (platform === 'gemini') {
+        const starredFileId = await this.findFileForScope(token, STARRED_FILE_NAME, accountScope);
+        if (starredFileId) {
+          starred = await this.downloadFileWithRetry(token, starredFileId);
+          console.log('[GoogleDriveSyncService] Starred messages downloaded');
+        }
+      }
+
+      // Download fork nodes file (only for Gemini platform)
+      let forks: ForkExportPayload | null = null;
+      if (platform === 'gemini') {
+        const forksFileId = await this.findFileForScope(token, FORKS_FILE_NAME, accountScope);
+        if (forksFileId) {
+          forks = await this.downloadFileWithRetry(token, forksFileId);
+          console.log('[GoogleDriveSyncService] Fork nodes downloaded');
+        }
+      }
+
+      if (!folders && !prompts && !starred && !forks) {
+        console.log(`[GoogleDriveSyncService] No sync files found for ${platform}`);
+        this.updateState({ isSyncing: false });
+        return null;
+      }
+
+      const syncTime = Date.now();
+      // Update platform-specific sync time
+      if (platform === 'aistudio') {
+        this.updateState({ isSyncing: false, lastSyncTimeAIStudio: syncTime, error: null });
+      } else {
+        this.updateState({ isSyncing: false, lastSyncTime: syncTime, error: null });
+      }
+      await this.saveState();
+
+      return { folders, prompts, starred, forks };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Download failed';
+      console.error('[GoogleDriveSyncService] Download failed:', error);
+      this.updateState({ isSyncing: false, error: errorMessage });
+      return null;
+    }
+  }
+
+  // ============== Private Methods ==============
+
+  private async loadCachedToken(): Promise<void> {
+    try {
+      const result = await chrome.storage.local.get(['gvAccessToken', 'gvTokenExpiry']);
+      if (result.gvAccessToken && result.gvTokenExpiry && result.gvTokenExpiry > Date.now()) {
+        this.accessToken = result.gvAccessToken;
+        this.tokenExpiry = result.gvTokenExpiry;
+        console.log('[GoogleDriveSyncService] Loaded cached token');
+      }
+    } catch (error) {
+      console.error('[GoogleDriveSyncService] Failed to load cached token:', error);
+    }
+  }
+
+  private async saveToken(token: string, expiresIn: number): Promise<void> {
+    this.accessToken = token;
+    this.tokenExpiry = Date.now() + expiresIn * 1000 - 60000;
+    try {
+      await chrome.storage.local.set({ gvAccessToken: token, gvTokenExpiry: this.tokenExpiry });
+    } catch (error) {
+      console.error('[GoogleDriveSyncService] Failed to save token:', error);
+    }
+  }
+
+  private async clearToken(): Promise<void> {
+    this.accessToken = null;
+    this.tokenExpiry = 0;
+    try {
+      await chrome.storage.local.remove(['gvAccessToken', 'gvTokenExpiry']);
+    } catch (error) {
+      console.error('[GoogleDriveSyncService] Failed to clear token:', error);
+    }
+  }
+
+  private isUserDeniedAuthError(message: string): boolean {
+    const normalized = message.toLowerCase();
+    return (
+      normalized.includes('did not approve access') ||
+      normalized.includes('user denied') ||
+      normalized.includes('access_denied')
+    );
+  }
+
+  private extractIdentityToken(result: unknown): string | null {
+    if (typeof result === 'string' && result.trim()) {
+      return result;
+    }
+
+    if (typeof result === 'object' && result !== null) {
+      const token = (result as { token?: unknown }).token;
+      if (typeof token === 'string' && token.trim()) {
+        return token;
+      }
+    }
+
+    return null;
+  }
+
+  private async requestIdentityAuthToken(
+    interactive: boolean,
+  ): Promise<{ token: string | null; userDenied: boolean }> {
+    const identity = chrome.identity;
+    if (!identity?.getAuthToken) {
+      return { token: null, userDenied: false };
+    }
+
+    try {
+      const tokenResult = await new Promise<unknown>((resolve, reject) => {
+        identity.getAuthToken({ interactive }, (token) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+          } else {
+            resolve(token);
+          }
+        });
+      });
+
+      const token = this.extractIdentityToken(tokenResult);
+      if (!token) {
+        return { token: null, userDenied: false };
+      }
+
+      // getAuthToken does not provide expiry; keep a short TTL and persist for worker restarts.
+      await this.saveToken(token, IDENTITY_TOKEN_TTL_SECONDS);
+      return { token, userDenied: false };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const userDenied = this.isUserDeniedAuthError(message);
+      if (!userDenied) {
+        console.warn('[GoogleDriveSyncService] identity.getAuthToken failed:', error);
+      }
+      return { token: null, userDenied };
+    }
+  }
+
+  private async getTokenFromIdentity(
+    interactive: boolean,
+  ): Promise<{ token: string | null; userDenied: boolean }> {
+    if (!chrome.identity?.getAuthToken) {
+      return { token: null, userDenied: false };
+    }
+
+    const nonInteractiveResult = await this.requestIdentityAuthToken(false);
+    if (nonInteractiveResult.token) {
+      return nonInteractiveResult;
+    }
+
+    if (!interactive) {
+      return { token: null, userDenied: false };
+    }
+
+    return this.requestIdentityAuthToken(true);
+  }
+
+  private async removeCachedAuthToken(token: string): Promise<void> {
+    const identity = chrome.identity;
+    if (!identity?.removeCachedAuthToken) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      identity.removeCachedAuthToken({ token }, () => resolve());
+    });
+  }
+
+  private async getTokenFromLegacyWebAuthFlow(): Promise<string | null> {
+    const manifest = chrome.runtime.getManifest();
+    const clientId = manifest.oauth2?.client_id;
+    const scopes = manifest.oauth2?.scopes?.join(' ');
+
+    if (!clientId || !scopes) {
+      console.error('[GoogleDriveSyncService] Missing oauth2 config');
+      return null;
+    }
+
+    const redirectUrl = chrome.identity.getRedirectURL();
+    console.log('[GoogleDriveSyncService] Auth flow starting with redirectUrl:', redirectUrl);
+    const authUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+    authUrl.searchParams.set('client_id', clientId);
+    authUrl.searchParams.set('redirect_uri', redirectUrl);
+    authUrl.searchParams.set('response_type', 'token');
+    authUrl.searchParams.set('scope', scopes);
+
+    try {
+      const responseUrl = await new Promise<string>((resolve, reject) => {
+        chrome.identity.launchWebAuthFlow(
+          { url: authUrl.toString(), interactive: true },
+          (response) => {
+            if (chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message));
+            } else if (response) {
+              resolve(response);
+            } else {
+              reject(new Error('No response from auth flow'));
+            }
+          },
+        );
+      });
+
+      const url = new URL(responseUrl);
+      const hashParams = new URLSearchParams(url.hash.substring(1));
+      const accessToken = hashParams.get('access_token');
+      const expiresIn = parseInt(hashParams.get('expires_in') || '3600', 10);
+
+      if (accessToken) {
+        await this.saveToken(accessToken, expiresIn);
+        return accessToken;
+      }
+      return null;
+    } catch (error) {
+      console.error('[GoogleDriveSyncService] Auth flow failed:', error);
+      return null;
+    }
+  }
+
+  private async getAuthToken(interactive: boolean): Promise<string | null> {
+    if (this.accessToken && this.tokenExpiry > Date.now()) {
+      return this.accessToken;
+    }
+
+    if (this.accessToken && this.tokenExpiry <= Date.now()) {
+      this.accessToken = null;
+      this.tokenExpiry = 0;
+    }
+
+    await this.loadCachedToken();
+    if (this.accessToken && this.tokenExpiry > Date.now()) {
+      return this.accessToken;
+    }
+
+    const supportsIdentityApi = !!chrome.identity?.getAuthToken;
+    if (supportsIdentityApi) {
+      const identityResult = await this.getTokenFromIdentity(interactive);
+      if (identityResult.token) {
+        return identityResult.token;
+      }
+
+      if (!interactive) {
+        return null;
+      }
+
+      // Fallback: always try launchWebAuthFlow when getAuthToken fails.
+      // Some browsers (Arc) or Chrome versions may show an OAuth error page
+      // during getAuthToken, which looks like "user denied" when dismissed,
+      // but launchWebAuthFlow with a registered redirect URI can still succeed.
+      return this.getTokenFromLegacyWebAuthFlow();
+    }
+
+    if (!interactive) {
+      return null;
+    }
+
+    return this.getTokenFromLegacyWebAuthFlow();
+  }
+
+  private async findFile(token: string, fileName: string): Promise<string | null> {
+    const query = encodeURIComponent(`name='${fileName}' and trashed=false`);
+    const url = `${DRIVE_API_BASE}/files?q=${query}&fields=files(id,name)`;
+    const response = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!response.ok) {
+      throw new Error(`Failed to search files: ${response.status}`);
+    }
+    const result = await response.json();
+    return result.files?.[0]?.id || null;
+  }
+
+  private getFileNameForScope(baseFileName: string, accountScope: SyncAccountScope | null): string {
+    if (!accountScope) return baseFileName;
+
+    const suffix = `acct-${hashString(accountScope.accountKey)}`;
+    const dotIndex = baseFileName.lastIndexOf('.');
+    if (dotIndex <= 0) {
+      return `${baseFileName}.${suffix}`;
+    }
+    return `${baseFileName.slice(0, dotIndex)}.${suffix}${baseFileName.slice(dotIndex)}`;
+  }
+
+  private async findFileForScope(
+    token: string,
+    baseFileName: string,
+    accountScope: SyncAccountScope | null,
+  ): Promise<string | null> {
+    if (!accountScope) {
+      return this.findFile(token, baseFileName);
+    }
+
+    const scopedFileName = this.getFileNameForScope(baseFileName, accountScope);
+    const scopedFileId = await this.findFile(token, scopedFileName);
+    if (scopedFileId) return scopedFileId;
+
+    // Backward compatibility: allow reading legacy shared file before user uploads scoped data.
+    return this.findFile(token, baseFileName);
+  }
+
+  private async ensureFileId(
+    token: string,
+    fileName: string,
+    type: 'folders' | 'aistudio-folders' | 'prompts' | 'starred' | 'forks',
+  ): Promise<string> {
+    // 1. Ensure backup folder exists
+    const folderId = await this.ensureBackupFolder(token);
+
+    // 2. Check if we have a valid cached file ID
+    const currentId = this.fileIdByName[fileName] ?? null;
+
+    if (currentId) {
+      const parents = await this.getFileParents(token, currentId);
+      if (parents) {
+        // File exists
+        if (!parents.includes(folderId)) {
+          // File exists but not in the backup folder, move it
+          console.log(`[GoogleDriveSyncService] Moving ${fileName} to backup folder`);
+          await this.moveFile(token, currentId, folderId, parents);
+        }
+        return currentId;
+      }
+      // If checkFileParents returns null, the file doesn't exist (e.g. deleted externally), proceed to find/create
+    }
+
+    // 3. Search for the file globally (in case it was created before but we lost the ID reference)
+    const existingId = await this.findFile(token, fileName);
+    if (existingId) {
+      // Found existing file
+      this.setFileIdForType(type, existingId);
+      this.fileIdByName[fileName] = existingId;
+
+      // Check if it needs moving
+      const parents = await this.getFileParents(token, existingId);
+      if (parents && !parents.includes(folderId)) {
+        console.log(`[GoogleDriveSyncService] Moving existing ${fileName} to backup folder`);
+        await this.moveFile(token, existingId, folderId, parents);
+      }
+      return existingId;
+    }
+
+    // 4. Create new file in the backup folder
+    console.log(`[GoogleDriveSyncService] Creating new file ${fileName} in backup folder`);
+    const newId = await this.createFile(token, fileName, folderId);
+    this.setFileIdForType(type, newId);
+    this.fileIdByName[fileName] = newId;
+    return newId;
+  }
+
+  private setFileIdForType(
+    type: 'folders' | 'aistudio-folders' | 'prompts' | 'starred' | 'forks',
+    fileId: string,
+  ): void {
+    switch (type) {
+      case 'folders':
+        this.foldersFileId = fileId;
+        break;
+      case 'aistudio-folders':
+        this.aistudioFoldersFileId = fileId;
+        break;
+      case 'prompts':
+        this.promptsFileId = fileId;
+        break;
+      case 'starred':
+        this.starredFileId = fileId;
+        break;
+      case 'forks':
+        this.forksFileId = fileId;
+        break;
+    }
+  }
+
+  private async ensureBackupFolder(token: string): Promise<string> {
+    if (this.backupFolderId) {
+      // Verify it still exists
+      const exists = await this.checkFileExists(token, this.backupFolderId);
+      if (exists) return this.backupFolderId;
+    }
+
+    // Search for folder
+    const query = encodeURIComponent(
+      `name='${BACKUP_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+    );
+    const url = `${DRIVE_API_BASE}/files?q=${query}&fields=files(id)`;
+    const response = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!response.ok) throw new Error('Failed to search for backup folder');
+
+    const data = await response.json();
+    const existingId = data.files?.[0]?.id;
+
+    if (existingId) {
+      this.backupFolderId = existingId;
+      return existingId;
+    }
+
+    // Create folder
+    const metadata = {
+      name: BACKUP_FOLDER_NAME,
+      mimeType: 'application/vnd.google-apps.folder',
+    };
+    const createResponse = await fetch(`${DRIVE_API_BASE}/files`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(metadata),
+    });
+
+    if (!createResponse.ok) throw new Error('Failed to create backup folder');
+    const folderData = await createResponse.json();
+    this.backupFolderId = folderData.id;
+    console.log('[GoogleDriveSyncService] Created backup folder:', this.backupFolderId);
+    return folderData.id;
+  }
+
+  private async getFileParents(token: string, fileId: string): Promise<string[] | null> {
+    try {
+      // Also check if file is trashed - if so, treat as non-existent
+      const response = await fetch(`${DRIVE_API_BASE}/files/${fileId}?fields=parents,trashed`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (response.status === 404) return null;
+      if (!response.ok) return null;
+      const data = await response.json();
+      // If file is in trash, treat as non-existent so we create a new one
+      if (data.trashed) {
+        console.log(`[GoogleDriveSyncService] File ${fileId} is in trash, will create new one`);
+        return null;
+      }
+      return data.parents || [];
+    } catch {
+      return null;
+    }
+  }
+
+  private async moveFile(
+    token: string,
+    fileId: string,
+    targetFolderId: string,
+    currentParents: string[],
+  ): Promise<void> {
+    const previousParents = currentParents.join(',');
+    const url = `${DRIVE_API_BASE}/files/${fileId}?addParents=${targetFolderId}&removeParents=${previousParents}&fields=id,parents`;
+    const response = await fetch(url, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!response.ok) {
+      console.error('[GoogleDriveSyncService] Failed to move file:', await response.text());
+      // Don't throw, just log. It's not critical if move fails, as long as we can access the file.
+    }
+  }
+
+  private async checkFileExists(token: string, fileId: string): Promise<boolean> {
+    try {
+      const response = await fetch(`${DRIVE_API_BASE}/files/${fileId}?fields=id`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  private async createFile(token: string, fileName: string, parentId?: string): Promise<string> {
+    const metadata: { name: string; mimeType: string; parents?: string[] } = {
+      name: fileName,
+      mimeType: 'application/json',
+    };
+    if (parentId) {
+      metadata.parents = [parentId];
+    }
+
+    const response = await fetch(`${DRIVE_API_BASE}/files`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(metadata),
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to create file: ${response.status}`);
+    }
+    const result = await response.json();
+    return result.id;
+  }
+
+  private async uploadFileWithRetry(token: string, fileId: string, data: unknown): Promise<void> {
+    let delay = INITIAL_RETRY_DELAY_MS;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const url = `${DRIVE_UPLOAD_BASE}/files/${fileId}?uploadType=media`;
+        const response = await fetch(url, {
+          method: 'PATCH',
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(data),
+        });
+        if (!response.ok) {
+          throw new Error(`Upload failed: ${response.status}`);
+        }
+        return;
+      } catch (error) {
+        if (attempt === MAX_RETRIES) throw error;
+        await this.sleep(delay);
+        delay *= 2;
+      }
+    }
+  }
+
+  private async downloadFileWithRetry<T>(token: string, fileId: string): Promise<T | null> {
+    let delay = INITIAL_RETRY_DELAY_MS;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const url = `${DRIVE_API_BASE}/files/${fileId}?alt=media`;
+        const response = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+        if (!response.ok) {
+          if (response.status === 404) return null;
+          throw new Error(`Download failed: ${response.status}`);
+        }
+        return await response.json();
+      } catch (error) {
+        if (attempt === MAX_RETRIES) throw error;
+        await this.sleep(delay);
+        delay *= 2;
+      }
+    }
+    return null;
+  }
+
+  private async loadState(): Promise<void> {
+    try {
+      const result = await chrome.storage.local.get([
+        'gvSyncMode',
+        'gvLastSyncTime',
+        'gvLastUploadTime',
+        'gvLastSyncTimeAIStudio',
+        'gvLastUploadTimeAIStudio',
+        'gvSyncError',
+      ]);
+      this.state = {
+        mode: (result.gvSyncMode as SyncMode) || 'disabled',
+        lastSyncTime: result.gvLastSyncTime || null,
+        lastUploadTime: result.gvLastUploadTime || null,
+        lastSyncTimeAIStudio: result.gvLastSyncTimeAIStudio || null,
+        lastUploadTimeAIStudio: result.gvLastUploadTimeAIStudio || null,
+        error: result.gvSyncError || null,
+        isSyncing: false,
+        isAuthenticated: false,
+      };
+      const token = await this.getAuthToken(false);
+      this.state.isAuthenticated = !!token;
+    } catch (error) {
+      console.error('[GoogleDriveSyncService] Failed to load state:', error);
+    }
+  }
+
+  private async saveState(): Promise<void> {
+    try {
+      await chrome.storage.local.set({
+        gvSyncMode: this.state.mode,
+        gvLastSyncTime: this.state.lastSyncTime,
+        gvLastUploadTime: this.state.lastUploadTime,
+        gvLastSyncTimeAIStudio: this.state.lastSyncTimeAIStudio,
+        gvLastUploadTimeAIStudio: this.state.lastUploadTimeAIStudio,
+        gvSyncError: this.state.error,
+      });
+    } catch (error) {
+      console.error('[GoogleDriveSyncService] Failed to save state:', error);
+    }
+  }
+
+  private updateState(partial: Partial<SyncState>): void {
+    this.state = { ...this.state, ...partial };
+    this.notifyStateChange();
+  }
+
+  private notifyStateChange(): void {
+    if (this.stateChangeCallback) {
+      this.stateChangeCallback({ ...this.state });
+    }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+}
+
+export const googleDriveSyncService = new GoogleDriveSyncService();
