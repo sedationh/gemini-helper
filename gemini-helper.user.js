@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini Helper
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @description  Gemini enhancements migrated from Voyager — includes copy dollar-sign removal, chat width, default model, and timeline
 // @match        https://gemini.google.com/*
 // @license      MIT
