@@ -57,24 +57,36 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // 1. Strip Dollar Signs from Copy
+    // 1. Strip Dollar Signs from Copy (LaTeX delimiters only)
     // ═══════════════════════════════════════════════════════════════
     function initStripDollars() {
-        function stripDollars(text) {
-            return text.replace(/\$/g, '').replace(/\\([a-zA-Z]+)/g, '$1');
+        function stripLatexDelimiters(text) {
+            // Remove $$ ... $$ (display math) — strip the delimiters, keep inner content
+            text = text.replace(/\$\$([\s\S]*?)\$\$/g, '$1');
+            // Remove $ ... $ (inline math) — strip the delimiters, keep inner content
+            text = text.replace(/\$([^$\n]+?)\$/g, '$1');
+            // Clean up LaTeX backslash commands like \frac → frac
+            text = text.replace(/\\([a-zA-Z]+)/g, '$1');
+            return text;
+        }
+
+        function maybeStrip(text) {
+            if (!getSetting('stripDollarsEnabled', true)) return text;
+            return stripLatexDelimiters(text);
         }
 
         document.addEventListener('copy', function (e) {
+            if (!getSetting('stripDollarsEnabled', true)) return;
             const selection = window.getSelection().toString();
             if (selection && selection.includes('$')) {
-                e.clipboardData.setData('text/plain', stripDollars(selection));
+                e.clipboardData.setData('text/plain', stripLatexDelimiters(selection));
                 e.preventDefault();
             }
         }, true);
 
         const origWriteText = navigator.clipboard.writeText.bind(navigator.clipboard);
         navigator.clipboard.writeText = function (text) {
-            return origWriteText(stripDollars(text));
+            return origWriteText(maybeStrip(text));
         };
 
         const origWrite = navigator.clipboard.write.bind(navigator.clipboard);
@@ -86,7 +98,7 @@
                     return item.getType(type).then(function (blob) {
                         if (type === 'text/plain' || type === 'text/html') {
                             return blob.text().then(function (text) {
-                                blobs[type] = new Blob([stripDollars(text)], { type: type });
+                                blobs[type] = new Blob([maybeStrip(text)], { type: type });
                             });
                         }
                         blobs[type] = blob;
@@ -101,7 +113,42 @@
             });
         };
 
-        console.log(TAG, 'Strip dollars hooks installed');
+        // Floating toggle button for strip-dollars
+        function createStripDollarsUI() {
+            const enabled = getSetting('stripDollarsEnabled', true);
+
+            const btn = document.createElement('button');
+            btn.id = 'gemini-helper-strip-dollars-toggle';
+            btn.title = 'Strip LaTeX $ on Copy';
+            btn.textContent = '$';
+            Object.assign(btn.style, {
+                position: 'fixed', bottom: '120px', right: '52px', zIndex: '2147483640',
+                width: '36px', height: '36px', borderRadius: '50%', border: 'none',
+                background: enabled ? '#1a73e8' : '#5f6368', color: '#fff',
+                fontSize: '16px', cursor: 'pointer', boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
+                transition: 'background 0.2s', display: 'flex', alignItems: 'center',
+                justifyContent: 'center', fontFamily: 'sans-serif', fontWeight: 'bold',
+                textDecoration: enabled ? 'line-through' : 'none',
+            });
+
+            btn.addEventListener('click', () => {
+                const nowEnabled = !getSetting('stripDollarsEnabled', true);
+                setSetting('stripDollarsEnabled', nowEnabled);
+                btn.style.background = nowEnabled ? '#1a73e8' : '#5f6368';
+                btn.style.textDecoration = nowEnabled ? 'line-through' : 'none';
+                btn.title = nowEnabled ? 'Strip LaTeX $ on Copy (ON)' : 'Strip LaTeX $ on Copy (OFF)';
+            });
+
+            document.body.appendChild(btn);
+        }
+
+        if (document.body) {
+            createStripDollarsUI();
+        } else {
+            document.addEventListener('DOMContentLoaded', createStripDollarsUI);
+        }
+
+        console.log(TAG, 'Strip dollars hooks installed (LaTeX-aware)');
     }
 
     // ═══════════════════════════════════════════════════════════════
