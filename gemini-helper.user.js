@@ -1504,6 +1504,74 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
+    // 5. Title Sync - Update page title to match conversation title
+    // ═══════════════════════════════════════════════════════════════
+    function initTitleSync() {
+        const TITLE_SELECTORS = [
+            '.conversation-title',
+            'a.conversation.selected .title-text',
+            'a.conversation.selected .conversation-title',
+            '.selected-nav-item .title-text',
+            'a[aria-selected="true"] .title-text',
+            '.nav-content a.selected .title-text',
+        ];
+
+        let lastSyncedTitle = '';
+        let titleObserver = null;
+        let checkTimer = null;
+
+        function getCurrentConvoTitle() {
+            for (const sel of TITLE_SELECTORS) {
+                const el = document.querySelector(sel);
+                const text = el?.textContent?.trim();
+                if (text && text.length > 1) return text;
+            }
+            return null;
+        }
+
+        function syncTitle() {
+            const title = getCurrentConvoTitle();
+            if (title && title !== lastSyncedTitle) {
+                lastSyncedTitle = title;
+                document.title = title + ' - Gemini';
+                console.log(TAG, 'Title synced:', title);
+            }
+        }
+
+        function startObserving() {
+            // Periodic check as sidebar items can be lazy-loaded
+            if (checkTimer) clearInterval(checkTimer);
+            checkTimer = setInterval(syncTitle, 2000);
+
+            // Also observe sidebar mutations for faster response
+            if (titleObserver) titleObserver.disconnect();
+            const sidebar = document.querySelector('nav, .side-nav, side-navigation, side-navigation-v2, mat-sidenav');
+            if (sidebar) {
+                titleObserver = new MutationObserver(() => syncTitle());
+                titleObserver.observe(sidebar, { childList: true, subtree: true, characterData: true });
+            }
+        }
+
+        // SPA navigation: re-check on URL change
+        let lastUrl = location.href;
+        setInterval(() => {
+            if (location.href !== lastUrl) {
+                lastUrl = location.href;
+                lastSyncedTitle = '';
+                setTimeout(syncTitle, 500);
+            }
+        }, 500);
+
+        if (document.body) {
+            startObserving();
+        } else {
+            document.addEventListener('DOMContentLoaded', startObserving);
+        }
+
+        console.log(TAG, 'Title sync installed');
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     // Bootstrap - Initialize all features
     // ═══════════════════════════════════════════════════════════════
     initStripDollars();
@@ -1512,6 +1580,7 @@
         initChatWidth();
         initDefaultModel();
         initTimeline();
+        initTitleSync();
         console.log(TAG, 'All features initialized');
     }
 
